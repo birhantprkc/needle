@@ -184,6 +184,17 @@ needle playground --weights my.cact  # a tuned model
 
 Preset demos, editable tools/prompt, multi-turn follow-ups, and a "Finetune on these tools" button that runs the pipeline above and returns a downloadable `.cact`.
 
+## Environments (ready-made tool surfaces)
+
+`needle.environments` ships six: `smart_home`, `media_player`, `productivity`, `wearable`, `kitchen_appliance`, `data_capture`. Each module has `TOOLS`, `SYSTEM`, a lazily constructed `agent`, `TEST_CASES`, and `run_tests(min_confidence=0.0)`; `python -m needle.environments.smart_home` runs its frozen acceptance suite.
+
+```python
+from needle.environments import smart_home
+smart_home.agent.complete("dim the study lights to 30 percent")
+```
+
+Adapt by swapping the Literal values for your own and keeping the shapes: closed sets as enums, bounded numbers, verbatim copy for free text, five tools or fewer.
+
 ## CLI summary
 
 - `needle run --checkpoint <base.pkl> --query "..." --tools tools.json` - JAX reference inference from a checkpoint (dev path; normal inference is the Python `Needle` API above).

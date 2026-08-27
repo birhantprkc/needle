@@ -74,6 +74,19 @@ needle playground --weights my.cact    # a tuned model
 
 The server downloads and initializes the model before serving, so the first query is instant. The **Finetune on these tools** button runs the fine-tuning pipeline below from the UI and hands back a downloadable `.cact`.
 
+## Environments
+
+Ready-made tool surfaces in `needle.environments`: `smart_home`, `media_player`, `productivity`, `wearable`, `kitchen_appliance`, and `data_capture`. Each is a hand-curated set of tools whose enums, bounds, and descriptions map cleanly onto Needle's constrained decoding, with a ready agent and a frozen acceptance suite.
+
+```python
+from needle.environments import smart_home
+
+smart_home.agent.complete("dim the study lights to 30 percent")
+smart_home.run_tests()
+```
+
+`python -m needle.environments.smart_home` runs a suite from the shell. To adapt an environment to your product, swap the `Literal` values (rooms, contacts, categories) for your own and keep the shapes: closed sets as enums, bounded numbers, verbatim copy for free text, five tools or fewer. The full tool surfaces and the suite contract are in [doc/environments.md](doc/environments.md).
+
 ## Fine-tuning
 
 Needle fine-tunes with LoRA on the frozen base and merges the adapter at export, so a run is cheap and the tuned model is still a single `.cact` that runs on the same engine. The workflow is: (optionally) synthesize data, LoRA fine-tune, then build a tuned `.cact`. See [doc/finetuning.md](doc/finetuning.md) for dataset sizing, reading the loss curve, and troubleshooting.
