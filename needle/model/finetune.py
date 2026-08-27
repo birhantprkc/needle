@@ -193,16 +193,16 @@ def generate_main(args):
 
 def render_example(example):
     tools = example.get("tools", [])
-    tools_json = tools if isinstance(tools, str) else json.dumps(tools, separators=(",", ":"))
+    tools_json = tools if isinstance(tools, str) else json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
     answers = example.get("answers", example.get("function_calls", []))
-    answers_json = answers if isinstance(answers, str) else json.dumps(answers, separators=(",", ":"))
-    reasoning = example.get("reasoning", "")
-    system = example.get("system", "")
+    answers_json = answers if isinstance(answers, str) else json.dumps(answers, separators=(",", ":"), ensure_ascii=False)
+    reasoning = (example.get("reasoning") or "").strip()
+    system = (example.get("system") or "").strip()
     prefix = IM_START + "system\n" + system + IM_END + "\n" if system else ""
     prompt = (prefix + IM_START + "user\n" + TOOLS_START + tools_json + TOOLS_END + "\n"
               + example["query"] + IM_END + "\n" + IM_START + "assistant\n")
-    target = (THINK_START + reasoning + THINK_END + "\n"
-              + TOOL_CALL_START + answers_json + TOOL_CALL_END + IM_END)
+    think = THINK_START + "\n" + reasoning + "\n" + THINK_END + "\n" if reasoning else ""
+    target = think + TOOL_CALL_START + answers_json + TOOL_CALL_END + IM_END
     return prompt, target
 
 

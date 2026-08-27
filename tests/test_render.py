@@ -27,6 +27,44 @@ def test_render_example_markers():
     assert '"name":"f"' in target
 
 
+def test_render_example_matches_training_template():
+    from needle.model.finetune import render_example
+    from needle.model.tokenizer import (IM_END, THINK_START, THINK_END,
+                                        TOOL_CALL_START, TOOL_CALL_END)
+
+    example = {"tools": [], "query": "q", "reasoning": "'q' -> f",
+               "answers": [{"name": "f", "arguments": {}}]}
+    _, target = render_example(example)
+    assert target == (THINK_START + "\n'q' -> f\n" + THINK_END + "\n"
+                      + TOOL_CALL_START + '[{"name":"f","arguments":{}}]'
+                      + TOOL_CALL_END + IM_END)
+
+
+def test_render_example_empty_reasoning_omits_think():
+    from needle.model.finetune import render_example
+    from needle.model.tokenizer import THINK_START, TOOL_CALL_START
+
+    for example in ({"tools": [], "query": "q", "answers": []},
+                    {"tools": [], "query": "q", "reasoning": "", "answers": []},
+                    {"tools": [], "query": "q", "reasoning": None, "answers": []},
+                    {"tools": [], "query": "q", "reasoning": "  ", "answers": []}):
+        _, target = render_example(example)
+        assert THINK_START not in target
+        assert target.startswith(TOOL_CALL_START)
+
+
+def test_render_example_keeps_unicode():
+    from needle.model.finetune import render_example
+
+    example = {"tools": [{"name": "f", "parameters": {"type": "object", "properties": {
+                   "name": {"type": "string", "description": "café"}}}}],
+               "query": "add Tomás",
+               "answers": [{"name": "f", "arguments": {"name": "Tomás"}}]}
+    prompt, target = render_example(example)
+    assert "café" in prompt
+    assert '"Tomás"' in target
+
+
 def test_render_example_accepts_function_calls_alias():
     from needle.model.finetune import render_example
     example = {"tools": [], "query": "hi",
