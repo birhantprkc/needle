@@ -59,16 +59,18 @@ def _get_anon_id() -> str:
 def _send(event: str, props: dict | None) -> None:
     try:
         from . import __version__
-        from .agent.fetch import ENGINE_VERSION
+        from .agent.fetch import engine_version
+        properties = props or {}
+        generation = int(properties.get("generation", 2))
         payload = json.dumps({
             "event": event,
             "anon_id": _get_anon_id(),
             "version": __version__,
-            "engine": ENGINE_VERSION,
+            "engine": engine_version(generation),
             "os": platform.system(),
             "arch": platform.machine(),
             "python": platform.python_version(),
-            "props": props or {},
+            "props": properties,
         }).encode("utf-8")
         req = urllib.request.Request(
             ENDPOINT, data=payload,

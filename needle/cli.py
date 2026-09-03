@@ -148,6 +148,10 @@ def main():
                    help="Concurrent OpenRouter requests when generating (default: 8)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--out", type=str, default=None, help="Output adapter path (.pkl)")
+    p.add_argument(
+        "--qat-bits", choices=["auto", "none", "2", "4"], default="auto",
+        help="LoRA training numerics: auto matches the checkpoint export scheme "
+             "(default), or force none/2/4")
 
     p = sub.add_parser("generate-data")
     p.add_argument("--tools", type=str, default=None, help="Tool schemas JSON to seed generation")
@@ -171,12 +175,16 @@ def main():
                    help="Platform folder (e.g. macos-arm64), or Hugging Face spec: "
                         "<org>/<repo>/<file>.cact, or <org>/<repo> if it holds one archive")
     p.add_argument("--out", type=str, default=".", help="Directory to place the files")
+    p.add_argument("--generation", type=int, choices=[2, 3], default=2,
+                   help="Engine generation when downloading a platform build (default: 2)")
 
     p = sub.add_parser("fetch")
     p.add_argument("--out", type=str, default=None,
                    help="Directory to place the engine (default: the cache)")
     p.add_argument("--platform-tag", type=str, default=None,
                    help="Fetch the build for another device, e.g. manylinux2014_aarch64")
+    p.add_argument("--generation", type=int, choices=[2, 3], default=2,
+                   help="Needle engine generation to fetch (default: 2)")
 
     p = sub.add_parser("playground")
     p.add_argument("--weights", type=str, default=None,
@@ -191,7 +199,8 @@ def main():
         sys.exit(0)
 
     from ._telemetry import track
-    track("cli:" + args.command)
+    track("cli:" + args.command,
+          {"generation": getattr(args, "generation", 2)})
 
     if args.command == "run":
         from .model.run import main as run_main
@@ -213,7 +222,8 @@ def main():
             if args.spec not in fetch.PLATFORMS:
                 raise SystemExit("unknown platform, pick one of: "
                                  + ", ".join(fetch.PLATFORMS))
-            paths = fetch.download_platform(args.spec, args.out)
+            paths = fetch.download_platform(args.spec, args.out,
+                                            generation=args.generation)
             for path in paths:
                 print(f"  {'file':<9} {path}  {os.path.getsize(path) / 1e6:.2f} MB")
             runner = next((p for p in paths
@@ -221,7 +231,7 @@ def main():
             if runner:
                 print(f"  {'next':<9} {runner} --tools tools.json --serve")
         else:
-            fetch._register_download()
+            fetch._register_download(args.generation)
             repo, filename = _weights_spec(args.spec)
             if not filename:
                 cacts = [f for f in list_repo_files(repo) if f.endswith(".cact")]
@@ -237,13 +247,16 @@ def main():
             print(f"  {'next':<9} needle.Needle(weights={dest!r}, tools=[...])")
     elif args.command == "fetch":
         from .agent import fetch
+        generation = args.generation
+        version = fetch.engine_version(generation)
         dest = args.out or os.path.join(os.path.expanduser("~"), ".cache",
-                                        "cactus-needle", fetch.ENGINE_VERSION)
+                                        "cactus-needle", f"v{generation}", version)
         os.makedirs(dest, exist_ok=True)
-        path = fetch.fetch_library(fetch.ENGINE_VERSION, dest, tag=args.platform_tag)
+        path = fetch.fetch_library(version, dest, tag=args.platform_tag,
+                                   generation=generation)
         print(f"  {'engine':<9} {path}")
-        print(f"  {'deploy':<9} copy to ~/.cache/cactus-needle/{fetch.ENGINE_VERSION}/ "
-              f"on the device, or point NEEDLE_LIB_PATH at the file")
+        print(f"  {'deploy':<9} copy to ~/.cache/cactus-needle/v{generation}/{version}/ "
+              f"on the device, or point NEEDLE{generation}_LIB_PATH at the file")
     elif args.command == "playground":
         from .playground.server import main as playground_main
         playground_main(args)

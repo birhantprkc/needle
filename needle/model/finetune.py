@@ -297,6 +297,8 @@ def finetune_local(args, progress=None):
     import optax
     from .run import load_checkpoint
     from .architecture import SimpleAttentionNetwork
+    from .quantize import (configure_deploy, cq_ste_params,
+                           cq_ste_mixed_params, parse_bits_map)
 
     def emit(msg):
         print(msg, flush=True)
@@ -327,6 +329,29 @@ def finetune_local(args, progress=None):
     emit(f"  {'data':<9} {len(seqs)} examples  seq_len {max_len}  cap {args.max_len}")
 
     model = SimpleAttentionNetwork(config)
+    qat_mode = getattr(args, "qat_bits", "auto")
+    qat_mode = "none" if qat_mode is None else str(qat_mode).lower()
+    qat_bits = None
+    qat_bits_map = None
+    parsed_bits_map = None
+    if qat_mode == "auto":
+        qat_bits_map = getattr(config, "weight_bits", "") or None
+        if qat_bits_map:
+            parsed_bits_map = parse_bits_map(qat_bits_map)
+        else:
+            qat_bits = 4
+    elif qat_mode in ("2", "4"):
+        qat_bits = int(qat_mode)
+    elif qat_mode != "none":
+        raise ValueError("--qat-bits must be auto, none, 2, or 4")
+    qat_enabled = qat_bits is not None or qat_bits_map is not None
+    if qat_enabled:
+        configure_deploy(act_bits=getattr(config, "act_bits", 8),
+                         kv_bits=getattr(config, "kv_bits", 8))
+        scheme = f"mixed[{qat_bits_map}]" if qat_bits_map else f"W{qat_bits}"
+        emit(f"  {'numerics':<9} CQ {scheme} STE + A8 (matches export)")
+    else:
+        emit(f"  {'numerics':<9} full precision")
     paths = lora_target_paths(params)
     scale = args.lora_alpha / args.lora_rank
     lora = init_lora(params, paths, args.lora_rank, jax.random.PRNGKey(0))
@@ -352,7 +377,13 @@ def finetune_local(args, progress=None):
     emit(f"  {'schedule':<9} {total_steps} steps  warmup {warmup}  cosine decay  clip 1.0  (compiling...)")
 
     def loss_fn(lora, ids, mask):
-        logits = model.apply({"params": merge_lora(params, lora, scale)}, ids)
+        merged = merge_lora(params, lora, scale)
+        if qat_bits_map is not None:
+            bits_map, default_bits = parsed_bits_map
+            merged = cq_ste_mixed_params(merged, bits_map, default_bits)
+        elif qat_bits is not None:
+            merged = cq_ste_params(merged, qat_bits)
+        logits = model.apply({"params": merged}, ids, quant=qat_enabled)
         logits, targets, mask = logits[:, :-1], ids[:, 1:], mask[:, 1:]
         ce = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
         return (ce * mask).sum() / jnp.maximum(mask.sum(), 1.0)
@@ -395,6 +426,8 @@ def finetune_local(args, progress=None):
             "scale": float(scale),
             "base": base_path,
             "rank": args.lora_rank,
+            "qat_bits": qat_bits,
+            "qat_bits_map": qat_bits_map,
         }, handle)
     print(f"  {'adapter':<9} {out}")
     print(f"  {'next':<9} needle build {base_path} --lora {out}")
@@ -409,6 +442,8 @@ def build_main(args):
 
     params, config, _ = load_checkpoint(args.checkpoint, return_run=True)
 
+    adapter_qat_bits = None
+    adapter_qat_bits_map = None
     if args.lora:
         with open(args.lora, "rb") as handle:
             adapter = pickle.load(handle)
@@ -416,11 +451,29 @@ def build_main(args):
                 for key, v in adapter["lora"].items()}
         params = merge_lora(params, lora, adapter["scale"])
         print(f"  {'merged':<9} {len(lora)} weight groups  {args.lora}")
+        adapter_qat_bits = adapter.get("qat_bits")
+        adapter_qat_bits_map = adapter.get("qat_bits_map")
 
     bits = args.bits
-    bits_map = None if bits else (getattr(config, "weight_bits", "") or None)
-    if not bits and not bits_map:
-        bits = "4"
+    if adapter_qat_bits_map is not None:
+        if bits is not None:
+            raise ValueError(
+                "adapter was trained for the checkpoint's mixed CQ bit map, but "
+                f"--bits {bits} would deploy different numerics")
+        bits_map = adapter_qat_bits_map
+        print(f"  {'scheme':<9} CQ mixed[{bits_map}] from QAT adapter metadata")
+    elif adapter_qat_bits is not None:
+        if bits is not None and int(bits) != int(adapter_qat_bits):
+            raise ValueError(
+                f"adapter was trained for CQ W{adapter_qat_bits}, but --bits {bits} "
+                "would deploy different numerics; rebuild at the adapter bit width")
+        bits = str(adapter_qat_bits)
+        bits_map = None
+        print(f"  {'scheme':<9} CQ W{bits} from QAT adapter metadata")
+    else:
+        bits_map = None if bits else (getattr(config, "weight_bits", "") or None)
+        if not bits and not bits_map:
+            bits = "4"
 
     out = args.out or (os.path.splitext(os.path.basename(args.checkpoint))[0] + ".cact")
     info = write_export(params, config, out,

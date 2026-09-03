@@ -8,7 +8,9 @@
 | `agent.reset()` | Rewind the conversation, keep the tools loaded. |
 | `needle.tool` | Decorator that turns a function into a tool schema (attached as `fn._needle_tool`). |
 | `needle.Field(...)` | Per argument constraints, attached inline with `typing.Annotated` or passed as a default. |
-| `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. `weights` selects a tuned `.cact` and defaults to whatever the engine already has loaded. |
+| `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None, strict=True)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. Strict mode rejects temporal values that contradict literal source years and engine-reported ungrounded values. |
+
+When one tuned archive is active, `extract(..., weights=None)` inherits it for backwards compatibility. If both a Needle 2 and Needle 3 tune are active, pass `weights=` explicitly; the client refuses to guess between generations.
 
 ## Declaring tools
 
@@ -104,8 +106,9 @@ Needle solves every problem as a function call. The context declares what may be
 - Arguments contain only values evidenced by the input. An optional field with no evidence is omitted, not guessed; omission is the field-level `[]`.
 - `reasoning` is the model's short derivation of each argument from its source span (`'ten minutes' -> minutes 10`). It is generated unconstrained; only the call itself is grammar-constrained, so the JSON cannot be malformed while the derivation stays legible.
 - After you execute a call, pass the result back as the next `complete()`. The model continues from it, and later arguments may depend on earlier results: `search_for_contact` first, then `send_instant_message` with the returned `contact_id`. A final `"type": "respond"` with empty `function_calls` signals the loop is done; the answer is the tool results themselves, which `run()` collects on the final response as `results`. No free text is generated.
-- A session shares one toolset. Later turns are bare queries against the same tools; `reset()` rewinds the conversation and keeps the tools loaded.
-- Weights stay loaded for the process. Once a tuned `.cact` is bound, constructing or calling a base-model agent raises instead of silently answering with those weights; construct base-model agents before tuned ones, or run tuned and base workloads in separate processes. Rebinding agents on the same weights is fine.
+- An agent shares one toolset. Later turns are bare queries against the same tools; `reset()` rewinds the conversation and keeps the tools loaded.
+- Each tuned agent runs in its own worker process. The worker loads its `.cact` once and owns an independent engine, KV cache, and conversation without extending the native C API.
+- Needle 2 and Needle 3 archives carry different format tags. The package reads the tag and loads the matching native engine; it never feeds one generation's weights to the other engine.
 
 ## Extraction
 
@@ -155,10 +158,10 @@ Calibration holds for the base model only. Fine-tuning does not update the head,
 
 ## Offline devices
 
-The engine is fetched once and cached at `~/.cache/cactus-needle/<engine version>/`. Inference itself never touches the network, so an air gapped device only needs that one file in place. Three ways to get it there:
+Each generation's engine is fetched once and cached under `~/.cache/cactus-needle/v2/` or `v3/`. Inference itself never touches the network, so an air gapped device only needs the matching file in place. Three ways to get it there:
 
-1. `needle fetch` downloads the engine for the current machine into the cache and prints the path. `--out <dir>` places it elsewhere. `--platform-tag manylinux2014_aarch64` fetches the build for a different device; tags follow the wheel names on the Hugging Face repo (`macosx_11_0_arm64`, `manylinux2014_x86_64`, `musllinux_1_2_aarch64`, `win_amd64`, `win_arm64`). For the standalone engine runner, `needle download <platform> [--out <dir>]` (platform folder names like `macos-arm64`, `linux-x86_64`; the CLI prints the full list on an invalid name) copies that platform's engine files into `<out>/<platform>/` and marks the `needle` runner executable.
+1. `needle fetch --generation 2|3` downloads that engine for the current machine into the cache and prints the path. `--out <dir>` places it elsewhere. `--platform-tag manylinux2014_aarch64` fetches the build for a different device; tags follow the wheel names on the Hugging Face repo (`macosx_11_0_arm64`, `manylinux2014_x86_64`, `musllinux_1_2_aarch64`, `win_amd64`, `win_arm64`). For the standalone engine runner, `needle download <platform> --generation 2|3 [--out <dir>]` (platform folders include `macos-arm64`, `linux-x86_64`, `wasm`, and `wasm-component`; the CLI prints the full list on an invalid name) copies that platform's engine files into `<out>/<platform>/` and marks a native `needle` runner executable when present. The `wasm-component` target contains `needle.component.wasm` and the `cactus:needle/engine@2.0.0` WIT contract.
 2. Copy the file to the same cache path on the device, or drop it inside the installed `needle/` package directory, which wins over the cache.
-3. Set `NEEDLE_LIB_PATH=/path/to/libneedle.so` to load exactly that file and skip every lookup.
+3. Set `NEEDLE2_LIB_PATH=/path/to/libneedle.so` or `NEEDLE3_LIB_PATH=/path/to/libneedle.so` to override one generation. The legacy `NEEDLE_LIB_PATH` remains a Needle 2 alias; it is deliberately ignored for Needle 3 so a v3 archive cannot be sent to a v2 engine.
 
 The Python package itself installs offline the standard way: `pip download cactus-needle` on a connected machine, then `pip install --no-index --find-links <dir> cactus-needle` on the device. On a device that must never attempt the network, also set `HF_HUB_OFFLINE=1` so a missing engine fails fast with a clear error instead of trying to download.

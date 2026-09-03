@@ -24,11 +24,11 @@ def _write_data(path):
             handle.write(json.dumps(row) + "\n")
 
 
-def _finetune_args(data, checkpoint, out, ckpt_dir):
+def _finetune_args(data, checkpoint, out, ckpt_dir, qat_bits="auto"):
     return types.SimpleNamespace(
         jsonl_path=str(data), checkpoint=checkpoint, epochs=1, batch_size=2,
         lr=1e-3, lora_rank=4, lora_alpha=8.0, max_len=64, generate=0,
-        model=None, checkpoint_dir=str(ckpt_dir), out=str(out))
+        model=None, checkpoint_dir=str(ckpt_dir), out=str(out), qat_bits=qat_bits)
 
 
 def test_finetune_writes_adapter(tiny_checkpoint, tmp_path):
@@ -38,19 +38,27 @@ def test_finetune_writes_adapter(tiny_checkpoint, tmp_path):
     _write_data(data)
     out = tmp_path / "adapter.pkl"
     progress = []
-    finetune_local(_finetune_args(data, tiny_checkpoint, out, tmp_path / "ck"),
+    finetune_local(_finetune_args(data, tiny_checkpoint, out, tmp_path / "ck", qat_bits=4),
                    progress=progress.append)
 
     assert any("loss" in m for m in progress)
+    assert any("CQ W4 STE + A8" in m for m in progress)
     assert out.exists()
     with open(out, "rb") as handle:
         adapter = pickle.load(handle)
     assert adapter["rank"] == 4
     assert abs(adapter["scale"] - 2.0) < 1e-6
     assert adapter["base"] == tiny_checkpoint
+    assert adapter["qat_bits"] == 4
     assert adapter["lora"]
     for value in adapter["lora"].values():
         assert "A" in value and "B" in value
+
+    from needle.model.finetune import build_main
+    with pytest.raises(ValueError, match="trained for CQ W4"):
+        build_main(types.SimpleNamespace(checkpoint=tiny_checkpoint, lora=str(out),
+                                         out=str(tmp_path / "wrong.cact"),
+                                         upload=False, bits="2"))
 
 
 def test_finetune_then_build_merges(tiny_checkpoint, tmp_path):
@@ -68,3 +76,41 @@ def test_finetune_then_build_merges(tiny_checkpoint, tmp_path):
     assert os.path.exists(out)
     header, _ = read_export(out)
     assert header["num_tensors"] > 0
+
+
+def test_auto_qat_preserves_checkpoint_mixed_bit_map(tiny_checkpoint, tmp_path):
+    from needle.model.finetune import finetune_local, build_main
+    from needle.model.export import read_export
+
+    with open(tiny_checkpoint, "rb") as handle:
+        checkpoint = pickle.load(handle)
+    bit_map = "embedding=4,mhc=4,default=2"
+    checkpoint["config"]["weight_bits"] = bit_map
+    mixed_checkpoint = tmp_path / "mixed.pkl"
+    with open(mixed_checkpoint, "wb") as handle:
+        pickle.dump(checkpoint, handle)
+
+    data = tmp_path / "data.jsonl"
+    _write_data(data)
+    adapter_path = tmp_path / "mixed-adapter.pkl"
+    progress = []
+    finetune_local(_finetune_args(data, str(mixed_checkpoint), adapter_path,
+                                  tmp_path / "ck"), progress=progress.append)
+    assert any(f"mixed[{bit_map}]" in message for message in progress)
+    with open(adapter_path, "rb") as handle:
+        adapter = pickle.load(handle)
+    assert adapter["qat_bits"] is None
+    assert adapter["qat_bits_map"] == bit_map
+
+    out = tmp_path / "mixed.cact"
+    build_main(types.SimpleNamespace(checkpoint=str(mixed_checkpoint),
+                                     lora=str(adapter_path), out=str(out),
+                                     upload=False, bits=None))
+    header, tensors = read_export(out)
+    assert header["num_tensors"] == len(tensors)
+
+    with pytest.raises(ValueError, match="mixed CQ bit map"):
+        build_main(types.SimpleNamespace(checkpoint=str(mixed_checkpoint),
+                                         lora=str(adapter_path),
+                                         out=str(tmp_path / "wrong.cact"),
+                                         upload=False, bits="4"))

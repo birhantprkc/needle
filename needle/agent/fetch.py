@@ -3,14 +3,24 @@ import platform
 import sys
 import zipfile
 
-HF_REPO = "Cactus-Compute/needle2"
+ENGINE_REPOS = {
+    2: "Cactus-Compute/needle2",
+    3: "Cactus-Compute/needle3",
+}
+ENGINE_VERSIONS = {
+    2: "2.0.4",
+    3: "3.0.0",
+}
 
-ENGINE_VERSION = "2.0.3"
+# Backwards-compatible aliases for callers that explicitly fetch Needle 2.
+HF_REPO = ENGINE_REPOS[2]
+ENGINE_VERSION = ENGINE_VERSIONS[2]
 
 PLATFORMS = ("macos-arm64", "linux-x86_64", "linux-arm64", "linux-armv7",
              "linux-riscv64", "linux-mipsel", "windows-x86_64", "windows-arm64",
              "android-arm64", "android-armv7", "android-riscv64",
-             "ios-arm64", "ios-sim-arm64", "tvos-arm64", "watchos-arm64", "wasm")
+             "ios-arm64", "ios-sim-arm64", "tvos-arm64", "watchos-arm64", "wasm",
+             "wasm-component")
 
 
 def _lib_name_for(tag):
@@ -54,28 +64,43 @@ def _platform_tag():
     return family + arch
 
 
-def _register_download():
+def engine_repo(generation=2):
+    try:
+        return ENGINE_REPOS[int(generation)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported Needle generation: {generation}") from exc
+
+
+def engine_version(generation=2):
+    try:
+        return ENGINE_VERSIONS[int(generation)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported Needle generation: {generation}") from exc
+
+
+def _register_download(generation=2):
     from huggingface_hub import hf_hub_download
 
     try:
-        hf_hub_download(repo_id=HF_REPO, filename="config.json", repo_type="model",
+        hf_hub_download(repo_id=engine_repo(generation), filename="config.json", repo_type="model",
                         force_download=True)
     except Exception:
         pass
 
 
-def download_platform(name, out_dir):
+def download_platform(name, out_dir, generation=2):
     import shutil
     import stat
     from huggingface_hub import hf_hub_download, list_repo_files
 
-    _register_download()
-    files = [f for f in list_repo_files(HF_REPO) if f.startswith(name + "/")]
+    repo = engine_repo(generation)
+    _register_download(generation)
+    files = [f for f in list_repo_files(repo) if f.startswith(name + "/")]
     dest = os.path.join(out_dir, name)
     os.makedirs(dest, exist_ok=True)
     out = []
     for f in files:
-        cached = hf_hub_download(repo_id=HF_REPO, filename=f, repo_type="model")
+        cached = hf_hub_download(repo_id=repo, filename=f, repo_type="model")
         target = os.path.join(dest, os.path.basename(f))
         shutil.copyfile(cached, target)
         if os.path.basename(target) in ("needle", "needle.exe"):
@@ -85,14 +110,19 @@ def download_platform(name, out_dir):
     return out
 
 
-def fetch_library(version, dest_dir, tag=None):
+def fetch_library(version=None, dest_dir=None, tag=None, generation=2):
     from huggingface_hub import hf_hub_download
 
+    if dest_dir is None:
+        raise TypeError("dest_dir is required")
+    version = version or engine_version(generation)
     tag = tag or _platform_tag()
     wheel = "cactus_needle-{}-py3-none-{}.whl".format(version, tag)
-    _register_download()
-    path = hf_hub_download(repo_id=HF_REPO, filename="python/" + wheel, repo_type="model")
+    repo = engine_repo(generation)
+    _register_download(generation)
+    path = hf_hub_download(repo_id=repo, filename="python/" + wheel, repo_type="model")
     lib = _lib_name_for(tag)
+    os.makedirs(dest_dir, exist_ok=True)
     with zipfile.ZipFile(path) as archive:
         data = archive.read("needle/" + lib)
     out = os.path.join(dest_dir, lib)

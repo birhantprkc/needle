@@ -37,6 +37,11 @@ needle build checkpoints/needle2.pkl --lora adapter.pkl --out tuned.cact
 agent = needle.Needle(tools=[...], weights="tuned.cact")
 ```
 
+Fine-tuning is quantization-aware by default. `--qat-bits auto` trains through
+the checkpoint's declared CQ export scheme and records that scheme in the
+adapter; `needle build` rejects a conflicting bit-width override. Use
+`--qat-bits none` only when intentionally targeting float evaluation.
+
 To share a tuned model, set `NEEDLE_HF_REPO=<you>/<model>` and pass `--upload` to `needle build`; on any other machine `needle download <you>/<model>/tuned.cact` pulls it back down (or pass just `<you>/<model>` when the repo holds a single archive).
 
 Defaults: batch size 16, learning rate 0.0001 with warmup and cosine decay, gradient clipping at norm 1, rank 16, alpha 32, max length 1024, validation split 0.1. The base checkpoint downloads from Hugging Face on first run.
