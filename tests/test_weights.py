@@ -20,8 +20,9 @@ class _Stub:
         self.calls.append("load")
         return 0
 
-    def needle_complete(self, text, max_new_tokens, buffer, size):
+    def needle_complete(self, text, *args):
         self.calls.append("complete")
+        buffer = args[-2]
         buffer.value = ENVELOPE
         return 0
 
@@ -33,15 +34,24 @@ class _WorkerStub:
     next_pid = 1000
 
     def __init__(self, calls, library, weights, system, tools, tool_index,
-                 buffer_size):
+                 buffer_size, generation=2):
         self.calls = calls
         self.pid = type(self).next_pid
         type(self).next_pid += 1
         self.calls.append(("worker_start", self.pid, library, weights))
 
-    def complete(self, text, max_new_tokens):
-        self.calls.append(("worker_complete", self.pid, text))
+    def complete(self, text, max_new_tokens, audio=None):
+        if audio:
+            self.calls.append(("worker_complete_audio", self.pid, text,
+                               audio))
+        else:
+            self.calls.append(("worker_complete", self.pid, text))
         return ENVELOPE.decode("utf-8")
+
+    def embed(self, text, audio=None):
+        self.calls.append(("worker_embed", self.pid, text,
+                           audio))
+        return [0.6, 0.8]
 
     def reset(self):
         self.calls.append(("worker_reset", self.pid))
@@ -61,9 +71,10 @@ def engine(monkeypatch):
                         lambda generation=2: f"/tmp/libneedle{generation}")
     monkeypatch.setattr(
         needle, "FineTuneWorker",
-        lambda library, weights, system, tools, tool_index, buffer_size:
+        lambda library, weights, system, tools, tool_index, buffer_size,
+               generation=2:
             _WorkerStub(calls, library, weights, system, tools, tool_index,
-                        buffer_size))
+                        buffer_size, generation))
     monkeypatch.setattr(needle, "_active", {})
     return calls
 
@@ -151,6 +162,16 @@ def test_v2_and_v3_weights_route_to_independent_engines(engine, tuned, tuned_v3,
     assert v2._generation == 2
     assert v3._generation == 3
     assert routed == [2, 3]
+
+
+def test_v3_routes_audio_and_embeddings_to_its_worker(engine, tuned_v3):
+    agent = _tuned_agent(tuned_v3)
+    wav = b"RIFFordinary wav bytes"
+    agent.complete("transcribe", audio=wav)
+    assert agent.embed("schema", audio=wav) == [0.6, 0.8]
+    payload = {"data": wav, "format": 1, "sample_rate": 0, "channels": 1}
+    assert ("worker_complete_audio", agent._worker.pid, "transcribe", payload) in engine
+    assert ("worker_embed", agent._worker.pid, "schema", payload) in engine
 
 
 def test_unknown_archive_tag_is_rejected_before_loading(engine, tmp_path):

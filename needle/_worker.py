@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -12,6 +13,36 @@ import threading
 
 _HEADER = struct.Struct("!Q")
 _EOF = object()
+
+
+class _NeedleAudio(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_uint64),
+        ("sample_rate", ctypes.c_int),
+        ("channels", ctypes.c_int),
+        ("format", ctypes.c_int),
+    ]
+
+
+def _native_audio(payload):
+    if not payload:
+        return None, None
+    data = base64.b64decode(payload["data"], validate=True)
+    storage = ctypes.create_string_buffer(data, len(data))
+    descriptor = _NeedleAudio(
+        ctypes.cast(storage, ctypes.c_void_p), len(data),
+        int(payload["sample_rate"]), int(payload["channels"]),
+        int(payload["format"]))
+    return ctypes.byref(descriptor), (storage, descriptor)
+
+
+def _wire_audio(payload):
+    if payload is None:
+        return None
+    return {"data": base64.b64encode(payload["data"]).decode("ascii"),
+            "sample_rate": payload["sample_rate"],
+            "channels": payload["channels"], "format": payload["format"]}
 
 
 def _read_exact(stream, size):
@@ -47,13 +78,22 @@ def _write_message(stream, message):
     stream.flush()
 
 
-def _load_library(path):
+def _load_library(path, generation=2):
     lib = ctypes.CDLL(path)
     lib.needle_init.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
                                 ctypes.c_char_p]
     lib.needle_init.restype = ctypes.c_int
-    lib.needle_complete.argtypes = [ctypes.c_char_p, ctypes.c_int,
-                                    ctypes.c_char_p, ctypes.c_int]
+    if int(generation) >= 3:
+        lib.needle_complete.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(_NeedleAudio), ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_int]
+        lib.needle_embed.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(_NeedleAudio),
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        lib.needle_embed.restype = ctypes.c_int
+    else:
+        lib.needle_complete.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                        ctypes.c_char_p, ctypes.c_int]
     lib.needle_complete.restype = ctypes.c_int
     lib.needle_reset.argtypes = []
     lib.needle_reset.restype = None
@@ -70,7 +110,8 @@ def _child():
         config = _read_message(source)
         if config is None:
             return 1
-        lib = _load_library(config["library"])
+        generation = int(config.get("generation", 2))
+        lib = _load_library(config["library"], generation)
         with open(config["weights"], "rb") as handle:
             weights = handle.read()
         if lib.needle_load(weights, len(weights)) < 0:
@@ -90,9 +131,15 @@ def _child():
                 break
             operation = request.get("operation")
             if operation == "complete":
-                code = lib.needle_complete(
-                    request["text"].encode("utf-8"),
-                    int(request["max_new_tokens"]), output, len(output))
+                if generation >= 3:
+                    audio, keepalive = _native_audio(request.get("audio"))
+                    code = lib.needle_complete(
+                        request["text"].encode("utf-8"), audio,
+                        int(request["max_new_tokens"]), output, len(output))
+                else:
+                    code = lib.needle_complete(
+                        request["text"].encode("utf-8"),
+                        int(request["max_new_tokens"]), output, len(output))
                 if code < 0:
                     _write_message(protocol, {
                         "status": "error",
@@ -102,6 +149,34 @@ def _child():
                     _write_message(protocol, {
                         "status": "ok",
                         "response": output.value.decode("utf-8"),
+                    })
+            elif operation == "embed":
+                if generation < 3:
+                    _write_message(protocol, {
+                        "status": "error",
+                        "message": "embeddings require a Needle 3 model",
+                    })
+                    continue
+                audio, keepalive = _native_audio(request.get("audio"))
+                text = request["text"].encode("utf-8")
+                dim = lib.needle_embed(text, audio, None, 0)
+                if dim <= 0:
+                    _write_message(protocol, {
+                        "status": "error",
+                        "message": f"needle_embed failed (code {dim})",
+                    })
+                    continue
+                embedding = (ctypes.c_float * dim)()
+                code = lib.needle_embed(text, audio, embedding, dim)
+                if code != dim:
+                    _write_message(protocol, {
+                        "status": "error",
+                        "message": f"needle_embed failed (code {code})",
+                    })
+                else:
+                    _write_message(protocol, {
+                        "status": "ok",
+                        "embedding": list(embedding),
                     })
             elif operation == "reset":
                 lib.needle_reset()
@@ -130,7 +205,7 @@ def _child():
 
 class FineTuneWorker:
     def __init__(self, library, weights, system, tools, tool_index,
-                 buffer_size, startup_timeout=300):
+                 buffer_size, startup_timeout=300, generation=2):
         self._lock = threading.Lock()
         self._messages = queue.Queue()
         self._closed = False
@@ -148,6 +223,7 @@ class FineTuneWorker:
                 "tools": tools,
                 "tool_index": tool_index,
                 "buffer_size": int(buffer_size),
+                "generation": int(generation),
             })
             ready = self._receive(startup_timeout)
             if ready.get("status") != "ready":
@@ -205,12 +281,20 @@ class FineTuneWorker:
                 raise RuntimeError(response.get("message", "Needle worker failed"))
             return response
 
-    def complete(self, text, max_new_tokens):
+    def complete(self, text, max_new_tokens, audio=None):
         return self._request({
             "operation": "complete",
             "text": text,
             "max_new_tokens": int(max_new_tokens),
+            "audio": _wire_audio(audio),
         })["response"]
+
+    def embed(self, text, audio=None):
+        return self._request({
+            "operation": "embed",
+            "text": text,
+            "audio": _wire_audio(audio),
+        })["embedding"]
 
     def reset(self):
         self._request({"operation": "reset"})

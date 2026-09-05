@@ -76,13 +76,71 @@ _lib_handles = {}
 _active = {}
 
 
+class _NeedleAudio(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_uint64),
+        ("sample_rate", ctypes.c_int),
+        ("channels", ctypes.c_int),
+        ("format", ctypes.c_int),
+    ]
+
+
+_AUDIO_FORMATS = {"wav": 1, "pcm16": 2, "float32": 3}
+
+
+def _prepare_audio(audio, audio_format="wav", sample_rate=0, channels=1):
+    if audio is None:
+        return None
+    if isinstance(audio, (str, os.PathLike)):
+        with open(os.fspath(audio), "rb") as handle:
+            data = handle.read()
+    else:
+        try:
+            data = bytes(audio)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("audio must be a path or bytes-like object") from exc
+    if not data:
+        raise ValueError("audio is empty")
+    try:
+        format_code = _AUDIO_FORMATS[str(audio_format).lower()]
+    except KeyError as exc:
+        raise ValueError("audio_format must be 'wav', 'pcm16', or 'float32'") from exc
+    if format_code != _AUDIO_FORMATS["wav"] and (
+            int(sample_rate) <= 0 or int(channels) <= 0):
+        raise ValueError("PCM audio requires positive sample_rate and channels")
+    return {"data": data, "format": format_code,
+            "sample_rate": int(sample_rate), "channels": int(channels)}
+
+
+def _native_audio(payload):
+    if payload is None:
+        return None, None
+    data = payload["data"]
+    storage = ctypes.create_string_buffer(data, len(data))
+    descriptor = _NeedleAudio(
+        ctypes.cast(storage, ctypes.c_void_p), len(data),
+        payload["sample_rate"], payload["channels"], payload["format"])
+    return ctypes.byref(descriptor), (storage, descriptor)
+
+
 def _lib(generation=2):
     generation = int(generation)
     if generation not in _lib_handles:
         lib = ctypes.CDLL(_library_path(generation))
         lib.needle_init.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         lib.needle_init.restype = ctypes.c_int
-        lib.needle_complete.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        if generation >= 3:
+            lib.needle_complete.argtypes = [
+                ctypes.c_char_p, ctypes.POINTER(_NeedleAudio), ctypes.c_int,
+                ctypes.c_char_p, ctypes.c_int]
+            lib.needle_embed.argtypes = [
+                ctypes.c_char_p, ctypes.POINTER(_NeedleAudio),
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+            lib.needle_embed.restype = ctypes.c_int
+        else:
+            lib.needle_complete.argtypes = [
+                ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
         lib.needle_complete.restype = ctypes.c_int
         lib.needle_reset.argtypes = []
         lib.needle_reset.restype = None
@@ -117,7 +175,7 @@ class Needle:
                 _library_path(self._generation), self._weights,
                 self._system.decode("utf-8"), self._tools_json.decode("utf-8"),
                 os.fspath(tool_index_path) if tool_index_path else None,
-                buffer_size)
+                buffer_size, generation=self._generation)
         else:
             self._bind()
 
@@ -154,21 +212,34 @@ class Needle:
         return {"n_tools": self._n_tools, "tuned": bool(self._weights),
                 "generation": self._generation}
 
-    def complete(self, text: str, max_new_tokens: int = 256) -> dict:
+    def complete(self, text: str = "", max_new_tokens: int = 256,
+                 audio=None, audio_format="wav", sample_rate=0,
+                 channels=1) -> dict:
         _track("complete", self._track_props())
-        return self._complete(text, max_new_tokens)
+        payload = _prepare_audio(audio, audio_format, sample_rate, channels)
+        return self._complete(text, max_new_tokens, payload)
 
-    def _complete(self, text: str, max_new_tokens: int = 256) -> dict:
+    def _complete(self, text: str, max_new_tokens: int = 256,
+                  audio=None) -> dict:
+        if audio is not None and self._generation < 3:
+            raise ValueError("audio requires a Needle 3 model")
         self._bind()
         if self._worker is not None:
-            raw = self._worker.complete(text, max_new_tokens)
+            raw = self._worker.complete(text, max_new_tokens, audio)
         else:
             lib = _lib(self._generation)
-            rc = lib.needle_complete(
-                text.encode("utf-8"), int(max_new_tokens), self._buffer,
-                len(self._buffer))
+            if self._generation >= 3:
+                native_audio, keepalive = _native_audio(audio)
+                rc = lib.needle_complete(
+                    text.encode("utf-8"), native_audio, int(max_new_tokens),
+                    self._buffer, len(self._buffer))
+            else:
+                rc = lib.needle_complete(
+                    text.encode("utf-8"), int(max_new_tokens), self._buffer,
+                    len(self._buffer))
             if rc < 0:
-                raise RuntimeError(f"needle_complete failed (code {rc})")
+                detail = self._buffer.value.decode("utf-8", "replace")
+                raise RuntimeError(detail or f"needle_complete failed (code {rc})")
             raw = self._buffer.value.decode("utf-8")
         try:
             response = json.loads(raw)
@@ -180,9 +251,31 @@ class Needle:
             response["confidence"] = None
         return response
 
-    def run(self, query: str, max_steps: int = 8, max_new_tokens: int = 256) -> dict:
+    def embed(self, text: str = "", audio=None, audio_format="wav",
+              sample_rate=0, channels=1) -> list[float]:
+        if self._generation < 3:
+            raise ValueError("embeddings require a Needle 3 model")
+        payload = _prepare_audio(audio, audio_format, sample_rate, channels)
+        self._bind()
+        if self._worker is not None:
+            return self._worker.embed(text, payload)
+        lib = _lib(self._generation)
+        native_audio, keepalive = _native_audio(payload)
+        dim = lib.needle_embed(text.encode("utf-8"), native_audio, None, 0)
+        if dim <= 0:
+            raise RuntimeError(f"needle_embed failed (code {dim})")
+        output = (ctypes.c_float * dim)()
+        rc = lib.needle_embed(text.encode("utf-8"), native_audio, output, dim)
+        if rc != dim:
+            raise RuntimeError(f"needle_embed failed (code {rc})")
+        return list(output)
+
+    def run(self, query: str = "", max_steps: int = 8,
+            max_new_tokens: int = 256, audio=None, audio_format="wav",
+            sample_rate=0, channels=1) -> dict:
         _track("run", self._track_props())
-        response = self._complete(query, max_new_tokens)
+        payload = _prepare_audio(audio, audio_format, sample_rate, channels)
+        response = self._complete(query, max_new_tokens, payload)
         executed = []
         for _ in range(max_steps):
             calls = response.get("function_calls") or []

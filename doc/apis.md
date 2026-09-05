@@ -3,12 +3,27 @@
 | Call | What it does |
 | --- | --- |
 | `needle.Needle(tools=None, system=None, weights=None, tool_index_path=None, buffer_size=65536)` | Create an agent bound to one toolset. `tools` takes decorated functions, Pydantic models, raw JSON schema dicts, or a JSON string. `system` carries environment facts. `weights` loads a tuned `.cact`. `tool_index_path` persists tool embeddings for large catalogues. |
-| `agent.run(query, max_steps=8, max_new_tokens=256)` | Full agentic loop: the model picks calls, Needle executes your Python functions and feeds results back, and the final response carries the executed tool results as `results`. |
-| `agent.complete(text, max_new_tokens=256)` | One turn. You execute the call and feed the result back yourself via the next `complete(...)`. |
+| `agent.complete(text="", max_new_tokens=256, audio=None, audio_format="wav", sample_rate=0, channels=1)` | Complete a text, speech, or mixed turn. `audio` accepts WAV bytes or a path; PCM16 and float32 buffers use the accompanying format, rate, and channel fields. |
+| `agent.embed(text="", audio=None, audio_format="wav", sample_rate=0, channels=1)` | Embed text, serialized tool schemas, audio, or a mixed input with the Needle 3 retrieval head. |
+| `agent.run(query="", max_steps=8, max_new_tokens=256, audio=None, audio_format="wav", sample_rate=0, channels=1)` | Full agentic loop: the model picks calls, Needle executes your Python functions and feeds results back, and the final response carries the executed tool results as `results`. |
 | `agent.reset()` | Rewind the conversation, keep the tools loaded. |
 | `needle.tool` | Decorator that turns a function into a tool schema (attached as `fn._needle_tool`). |
 | `needle.Field(...)` | Per argument constraints, attached inline with `typing.Annotated` or passed as a default. |
 | `needle.extract(text, schema, system=None, max_new_tokens=256, weights=None, strict=True)` | One shot extraction. Returns a Pydantic instance if `schema` is a model, else a dict, or `None` if nothing matched. Strict mode rejects temporal values that contradict literal source years and engine-reported ungrounded values. |
+
+Audio tokenization is internal. Pass a WAV path or WAV bytes directly:
+
+```python
+agent.complete(audio="command.wav")
+agent.embed(audio=wav_bytes)
+```
+
+Microphone PCM can be passed without wrapping it in a WAV container:
+
+```python
+agent.complete(audio=pcm16_bytes, audio_format="pcm16",
+               sample_rate=48_000, channels=2)
+```
 
 When one tuned archive is active, `extract(..., weights=None)` inherits it for backwards compatibility. If both a Needle 2 and Needle 3 tune are active, pass `weights=` explicitly; the client refuses to guess between generations.
 
